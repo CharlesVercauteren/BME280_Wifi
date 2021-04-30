@@ -1,10 +1,14 @@
 // BME280_Wifi
 //
 // ©2021 by Charles Vercauteren 
-// 09 mars 2021
+// 30 april 2021
 //
-// Tested on ARduino Uno Wifi.
+// Tested on Arduino Uno Wifi.
 // BME280 connected to I2C bus of Arduino.
+//
+// TODO:
+// Logging nakijken
+// LCD setup moet naar voor, maar geeft problemen
 //
 // Nederlands:
 //
@@ -54,25 +58,35 @@
 // Created 13 July 2010 by dlf (Metodo2 srl)
 // Modified 31 May 2012 by Tom Igoe
 
-// --- Run version, uncomment
+// Choose version, uncomment
+//-----------------------
 //#define DEBUG
+#define LCD
 
-// --- Wifi/EEPROM includes begin ---
+// Includes
+//---------
+// Wifi/EEPROM includes begin
 #include <WiFiNINA.h>
 #include <EEPROM.h>
 #include <IPAddress.h>
 
+// BME280
+#include <Adafruit_BME280.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <WiFiUdp.h>
+
+// LCD
+#ifdef LCD
+#include <LiquidCrystal.h>
+#endif
+
+// Variables and defines
+//----------------------
 // Seriële
 #define MAX_CHAR 32               // Max. number of chars for ssid, password and name
 #define CR '\r'                   // You can use CR or LF to end the input on the serial
 #define LF '\n'                   // line, but nog both !!! (See also include thermometer)
-bool dataAvailable = false;       // Data is available on serial.
-bool ssidOK = false;              // SSID is read.
-bool passwordOK = false;          // Password is read.
-bool hostnameOK = false;          // Name is read/
-bool dhcpOK = false;              // Choice DHCP/Fixed is made.
-bool fixedIpOK = false;           // Fixed IP-address is read.
-char receivedChars[MAX_CHAR];     // Number of chars received on serial.
 
 // EEPROM
 int ssidAddress = 0 ;             // EEPROM address ssid
@@ -96,15 +110,8 @@ int status = WL_IDLE_STATUS;      // Wifi radio status
 #define PIN_CONFIG   2
 bool configMode = false;          // Confifuration mode active.
 bool runOnce = true;              // Run code in loop only once.
-// --- Wifi/EEPROM includes end ---
 
-
-// --- BME280 begin ---
-#include <Adafruit_BME280.h>
-#include <SPI.h>
-#include <Wire.h>
-#include <WiFiUdp.h>
-
+// UDP
 WiFiUDP Udp;
 unsigned int localPort = 2000;
 char packetBuffer[256];              // Buffer to hold incoming packet
@@ -123,12 +130,13 @@ char replyBuffer[2048];
 #define SET_HOSTNAME            41
 #define UNKNOWN_COMMAND         99
 
-#define END_MARKER  LF        // End marker for data on serial line (see also above)
-
 // Diverse
 bool ledOnOff = false;    
+#ifdef LCD
+bool updateLCD = true;
+#endif
 
-//Time
+// Time
 int command = 0;
 short hours = 0;
 short minutes = 0;
@@ -137,10 +145,10 @@ short milliseconds = 0;
 unsigned long prevMillis = 0;
 unsigned long currentMillis = 0;
 
-// Temperature log
+// Logging
 #define MAX_LOG 24              //Number of log entries (adapt replyBuffer also !!!)
                                 // !!! Problemen indien 48, buffer te klein ? !!!
-#define MAX_LOGSECONDS  3600    // Number of seconds between logs
+#define MAX_LOGSECONDS  900    // Number of seconds between logs
 #ifdef DEBUG
   #define MAX_LOGSECONDS 60
 #endif
@@ -159,25 +167,32 @@ String timeLog[MAX_LOG];
 int indexLog = 0;
 
 // Init library objects
+//---------------------
+// BME
 Adafruit_BME280 bmp; // use I2C interface
 Adafruit_Sensor *bmp_temp = bmp.getTemperatureSensor();
 Adafruit_Sensor *bmp_pressure = bmp.getPressureSensor();
 Adafruit_Sensor *bmp_humidity = bmp.getHumiditySensor();
-// <-- BME280 end ---
 
+// LCD
+#ifdef LCD
+const int rs = 12, en = 11, d4 = 5, d5 = 4, d6 = 3, d7 = 2;
+LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
+#endif
 
-
+//******
+// Setup
+//******
 void setup() {
-// Setup begins --> LED on
+  // Setup begins --> LED on
   digitalWrite(LED_BUILTIN, HIGH);
   
-// --> Wifi/EEPROM setup begin ---
-  // Initialize serial and wait for port to open:
+  // Serial setup
   Serial.begin(9600);
-  while (!Serial) {
-    ; // wait for serial port to connect. Needed for native USB port only
-  }
+  while (!Serial) { ;}     // wait for serial port to connect. Needed for native USB port only
 
+
+  
   // Check for the WiFi module:
   if (WiFi.status() == WL_NO_MODULE) {
     Serial.println("No wifi module found, stopping !");
@@ -196,21 +211,27 @@ void setup() {
     configMode = true; 
     Serial.println("Config button pressed.");
   }
-// <-- Wifi/EEPROM setup end ---
-
-// --> BME280 setup begin ---
 
   // Start UDP server
   if (Udp.begin(localPort) != 1) {  
     Serial.println("UDP can't be started, stopping !");
     while(true); 
   } 
+
+
+
   
+  // BME280 setup
+  //-------------
   // Bosch Pressure/Temp sensor BME280
   // Sensor zit op I2C adres 0x76
   // Sensor ID is 0x60
   if (!bmp.begin(0x76)) {
     Serial.println(F("Could not find a valid BME280 sensor, check wiring!"));
+    #ifdef LCD
+    lcd.clear();
+    lcd.print("No BME280 sensor found !");
+    #endif
     while (1) delay(10);
   }
 
@@ -234,272 +255,230 @@ void setup() {
     pressureLog[i] = 0;
     humidityLog [i] = 0;
   }
-// <-- BME280 setup einde ---
+
+       // LCD setup
+  #ifdef LCD
+  lcd.begin(16, 2);
+  lcd.clear();
+  #endif 
+
+// Wifi setup
+//-----------
+  if (configMode) {
+    // Configmode
+    // ----------
+    // Reading SSID/wachtwoord/... from serial
+    
+    configMode = false;
+    String dhcpOrFixed = "";
+    
+    Serial.println("Timeout input is 60s !");
+    Serial.setTimeout(60000);
+    ssid = getStringFromSerial("SSID: ");
+    password = getStringFromSerial("Password: ");
+    hostname = getStringFromSerial("Hostname: ");
+    dhcpOrFixed = getStringFromSerial("DHCP/Fixed IP-address (D/F): ");
+    dhcpMode = true;
+    if (dhcpOrFixed == "F" || dhcpOrFixed == "f") { 
+      dhcpMode = false;
+      fixedIp = getStringFromSerial("IP-address (e.g. 192.168.0.1): ");
+      }
+    
+    Serial.println("Saving SSID/password in EEPROM.");
+    Serial.print("  SSID = "); Serial.println(ssid);
+    Serial.print("  Password = "); Serial.println(password);
+    Serial.print("  Name = "); Serial.println(hostname);
+    if (dhcpMode) { 
+      Serial.println("  DHCP mode"); 
+      }
+    else { 
+      Serial.println("  Fixed IP-address"); 
+      }
+    Serial.println(); Serial.println("Leaving config mode.");
+
+    saveSsidToEeprom(ssid);
+    savePasswordToEeprom(password);
+    saveHostnameToEeprom(hostname);
+    saveDhcpModeToEeprom(dhcpMode);
+    if (!dhcpMode) { 
+      saveIpAddressToEeprom(fixedIp);
+    }
+
+    Serial.println();
+  }
+
+  // Connect to wifi
+  // ---------------
+  // Read ssid/password/name
+  ssid="";
+  for (int i=0; i<MAX_CHAR; i++) { ssid+=String((char)EEPROM.read(ssidAddress+i)); }
+  password="";
+  for (int i=0; i<MAX_CHAR; i++) { password+=String((char)EEPROM.read(passwordAddress+i)); }
+  hostname="";
+  for (int i=0; i<MAX_CHAR; i++) { hostname+=String((char)EEPROM.read(hostnameAddress+i)); }
+  if (EEPROM.read(dhcpModeAddress)==0) { 
+    dhcpMode = false; 
+    fixedIp = "";
+    for (int i=0; i<MAX_CHAR; i++) { fixedIp+=String((char)EEPROM.read(fixedIpAddress+i)); }
+    Serial.println("Fixed mode.");
+    Serial.println(fixedIp);
+    }
+  else { 
+    dhcpMode = true; 
+    Serial.println("Dhcp mode.");
+  }
+
+  Serial.println("In EEPROM:");
+  Serial.print("  SSID = "); Serial.println(ssid);
+  Serial.print("  Password = "); Serial.println("********");
+  Serial.print("  Name = "); Serial.println(hostname);
+  Serial.print("  DHCP = ");
+  if (dhcpMode) { Serial.println("Yes"); }
+  else { 
+    Serial.println("No");  
+    Serial.print("  IP: "); Serial.println(fixedIp);
+    }
+      
+  if (!dhcpMode) { 
+    ip.fromString(fixedIp.c_str());
+    WiFi.config(ip);
+  }
+  while (status != WL_CONNECTED) {
+    #ifdef LCD
+    lcd.clear();
+    lcd.print("SSID: ");
+    lcd.setCursor(0,1);
+    lcd.print(ssid);
+    #endif
+    Serial.print("Attempting to connect to WPA SSID: ");
+    Serial.println(ssid);
+    // Connect to WPA/WPA2 network:
+    status = WiFi.begin(ssid.c_str(), password.c_str());
+    // Wacht 10 seconden en probeer opnieuw
+    delay(10000);
+  }
+
+  // We are connected, print info.
+  Serial.println("You're connected to the network");
+  printCurrentNet();
+  printWifiData();
+
+  // Init time to compilation time
+  hours = String(__TIME__).substring(0,2).toInt();
+  minutes = String(__TIME__).substring(3,5).toInt();
+
+  // Set up PIT for clock
+  initPIT();
 
 // Setup ends --> LED off
   digitalWrite(LED_BUILTIN, LOW);
 }
 
+//-----
+// Loop
+//-----
 void loop() {
-  
-// --> Wifi/EEPROM loop begin ---
-  if (configMode) {
-    // Configmode
-    // ----------
-    // Opvragen SSID/wachtwoord/...
-    static bool ssidRunOnce = false;      // Ask for SSID, show only once
-    static bool passwordRunOnce = true;   // Ask for password, show only once
-    static bool hostnameRunOnce = true;   // Ask for name, show only once
-    static bool dhcpRunOnce = true;       // Ask for dhcp/fixed keuze, show only once
-    static bool fixedIpRunOnce = true;    // Ask for IP-address, show only once
-      
-    if (!ssidRunOnce)     { Serial.print("\n  SSID: "); ssidRunOnce = true;  }
-    if (!passwordRunOnce) { Serial.print("\n  Password: "); passwordRunOnce = true; }
-    if (!hostnameRunOnce) { Serial.print("\n  Name: "); hostnameRunOnce = true; }
-    if (!dhcpRunOnce)     { Serial.print("\n  DHCP/Fixed IP-address (D/F): "); dhcpRunOnce = true; }
-    if (!fixedIpRunOnce)  { Serial.print("\n  IP-address (e.g. 192.168.0.1): "); fixedIpRunOnce = true; }
+  // Replystring for client
+  String replyString = "";
 
-    recvString();
-    if (dataAvailable) {
-      if (!ssidOK) {
-        // read ssid 
-        ssid = String(receivedChars);
-        ssidOK = true;
-        dataAvailable = false;
-        passwordRunOnce = false;
-      }
-      else if (!passwordOK) {
-        // Read password
-        password = String(receivedChars);
-        passwordOK = true;
-        dataAvailable = false;
-
-        hostnameRunOnce = false;
-      }
-      else if (!hostnameOK) {
-        // Read name
-        hostname = String(receivedChars);
-        hostnameOK = true;
-        dataAvailable = false;
-
-        dhcpRunOnce = false;
-      }
-      else if (!dhcpOK) {
-        // DHCP mode ?
-        if (String(receivedChars)=="D" || String(receivedChars)=="d") { 
-          Serial.println("DHCP mode");
-          dhcpMode = true;
-          fixedIpOK = true;         // No need to ask for IP-address
-          configMode = false;
-          }
-        else { 
-          dhcpMode = false; 
-          fixedIpRunOnce = false; 
-          }
-          
-        dataAvailable = false;
-        dhcpOK = true;
-      }
-      else if (!dhcpMode) {
-        fixedIp = String(receivedChars);
-        fixedIpOK = true;
-        dataAvailable = false;
-
-        configMode = false;
-      }
+  // Read data from client
+  int packetSize = Udp.parsePacket();
+  if (packetSize) {
+    // Data to packetBuffer
+    int len = Udp.read(packetBuffer, 255);
+    if (len > 0) {
+      packetBuffer[len] = 0;    // Make c-string from buffer data
     }
 
+    // Convert question from client to integer, commandos see higher.
+    command = String(packetBuffer).toInt();
+    #ifdef DEBUG
+      Serial.print("Received: ");Serial.println(command);
+    #endif
+    // Create reply for client = command + " " + result
+    // so client knows for which question the answer applies
+    replyString = String(command) + " ";
+    switch (command) {
+      case GET_TEMPERATURE:
+        replyString += String(currentTemperature); 
+        break;
+      case GET_HUMIDITY:
+        replyString += String(currentHumidity); 
+        break;          
+      case GET_PRESSURE:
+        replyString += String(currentPressure); 
+        break;
+      case SET_TIME:
+        hours = String(packetBuffer).substring(3,5).toInt();
+        minutes = String(packetBuffer).substring(6,8).toInt();
+        replyString += buildTimeString();
+        break;
+      case GET_TIME:
+        replyString += buildTimeString();
+        break;
+      case SET_LOG_INTERVAL:
+        maxLogSeconds = String(packetBuffer).substring(3).toInt();
+        replyString += String(maxLogSeconds);
+        break;
+      case GET_LOG_INTERVAL:
+        replyString += String(maxLogSeconds);
+        break;
+      case GET_LOG:
+        for (int i=indexLog; i<MAX_LOG; i++) {
+          replyString += timeLog[i];
+          replyString += "\t";
+          replyString += String(temperatureLog[i]);
+          replyString += "\t";
+          replyString += String(pressureLog[i]);
+          replyString += "\t";
+          replyString += String(humidityLog[i]);
+          replyString += "\n";
+        }
+        for (int i=0; i<indexLog; i++) {
+          replyString += timeLog[i];
+          replyString += "\t";
+          replyString += String(temperatureLog[i]);
+          replyString += "\t";
+          replyString += String(pressureLog[i]);
+          replyString += "\t";
+          replyString += String(humidityLog[i]);
+          replyString += "\n";
+        }
+        //Serial.println(replyString);
+        break;
+      case GET_HOSTNAME:
+        replyString += hostname; 
+        break; 
+      case SET_HOSTNAME:
+        hostname = String(packetBuffer).substring(3);
+        replyString += hostname;
+        saveHostnameToEeprom(hostname);
+        break;  
+      default:
+        replyString = String(UNKNOWN_COMMAND) + " "; 
+        break;
+    }
+
+    udpSendString(replyString);
     
-    if (ssidOK && passwordOK && hostnameOK && dhcpOK && fixedIpOK) {
-      Serial.println("Saving SSID/password in EEPROM.");
-      Serial.print("  SSID = "); Serial.println(ssid);
-      Serial.print("  Password = "); Serial.println(password);
-      Serial.print("  Name = "); Serial.println(hostname);
-      if (dhcpMode) { 
-        Serial.println("  DHCP mode"); 
-        }
-      else { 
-        Serial.println("  Fixed IP-address"); 
-        }
-      Serial.println(); Serial.println("Leaving config mode.");
-
-      saveSsidToEeprom(ssid);
-      savePasswordToEeprom(password);
-      saveHostnameToEeprom(hostname);
-      saveDhcpModeToEeprom(dhcpMode);
-      if (!dhcpMode) { 
-        saveIpAddressToEeprom(fixedIp);
-      }
-
-      Serial.println();
-    }
   }
-  else {
-    if (runOnce) {
-      Serial.println();
-      Serial.println("RunOnce");
-      
-      // Connect to wifi
-      // ---------------
-      // Read ssid/password/name
-      ssid="";
-      for (int i=0; i<MAX_CHAR; i++) { ssid+=(char)EEPROM.read(ssidAddress+i); }
-      password="";
-      for (int i=0; i<MAX_CHAR; i++) { password+=(char)EEPROM.read(passwordAddress+i); }
-      hostname="";
-      for (int i=0; i<MAX_CHAR; i++) { hostname+=(char)EEPROM.read(hostnameAddress+i); }
-      if (EEPROM.read(dhcpModeAddress)==0) { 
-        dhcpMode = false; 
-        fixedIp = "";
-        for (int i=0; i<MAX_CHAR; i++) { fixedIp+=(char)EEPROM.read(fixedIpAddress+i); }
-        Serial.println("Fixed mode.");
-        Serial.println(fixedIp);
-        }
-      else { 
-        dhcpMode = true; 
-        Serial.println("Dhcp mode.");
-      }
 
-      Serial.println("In EEPROM:");
-      Serial.print("  SSID = "); Serial.println(ssid);
-      Serial.print("  Password = "); Serial.println("********");
-      Serial.print("  Name = "); Serial.println(hostname);
-      Serial.print("  DHCP = ");
-      if (dhcpMode) { Serial.println("Yes"); }
-      else { 
-        Serial.println("No");  
-        Serial.print("  IP: "); Serial.println(fixedIp);
-        }
-      
-      if (!dhcpMode) { 
-        ip.fromString(fixedIp.c_str());
-        WiFi.config(ip);
-      }
-      while (status != WL_CONNECTED) {
-        Serial.print("Attempting to connect to WPA SSID: ");
-        Serial.println(ssid);
-        // Connect to WPA/WPA2 network:
-        status = WiFi.begin(ssid.c_str(), password.c_str());
-        // Wacht 10 seconden en probeer opnieuw
-        delay(10000);
-      }
+  // Measure and log temperature
+  measure();
+  logAll();
+  #ifdef LCD
+  if (updateLCD) {
+    lcd.clear();
+    lcd.print("T ");lcd.print(currentTemperature); lcd.print(" ");
+    lcd.print(buildTimeString());
+    lcd.setCursor(0,1);
 
-      // We'r" connected, print info.
-      Serial.println("You're connected to the network");
-      printCurrentNet();
-      printWifiData();
-      
-      runOnce = false;
-      Serial.println("Starting loop.");
+    lcd.print("P ");lcd.print((int)currentPressure); lcd.print("  ");
+    lcd.print("H ");lcd.print((int)currentHumidity); 
+    updateLCD = false;
     }
-// <-- Wifi/EEPROM loop end ---
-
-    else {
-      
-// --> BME280 loop begin ---
-      // Replystring for client
-      String replyString = "";
-
-      // Read data from client
-      int packetSize = Udp.parsePacket();
-      if (packetSize) {
-        // Data to packetBuffer
-        int len = Udp.read(packetBuffer, 255);
-        if (len > 0) {
-          packetBuffer[len] = 0;    // Make c-string from buffer data
-        }
-
-        // Convert question from client to integer, commandos see higher.
-        command = String(packetBuffer).toInt();
-        #ifdef DEBUG
-          Serial.print("Received: ");Serial.println(command);
-        #endif
-        // Create reply for client = command + " " + result
-        // so client knows for which question the answer applies
-        replyString = String(command) + " ";
-        switch (command) {
-          case GET_TEMPERATURE:
-            replyString += String(currentTemperature); 
-            break;
-          case GET_HUMIDITY:
-            replyString += String(currentHumidity); 
-            break;          
-          case GET_PRESSURE:
-            replyString += String(currentPressure); 
-            break;
-          case SET_TIME:
-            hours = String(packetBuffer).substring(3,5).toInt();
-            minutes = String(packetBuffer).substring(6,8).toInt();
-            replyString += buildTimeString();
-            break;
-          case GET_TIME:
-            replyString += buildTimeString();
-            break;
-          case SET_LOG_INTERVAL:
-            maxLogSeconds = String(packetBuffer).substring(3).toInt();
-            replyString += String(maxLogSeconds);
-            break;
-          case GET_LOG_INTERVAL:
-            replyString += String(maxLogSeconds);
-            break;
-          case GET_LOG:
-            for (int i=indexLog; i<MAX_LOG; i++) {
-              replyString += timeLog[i];
-              replyString += "\t";
-              replyString += String(temperatureLog[i]);
-              replyString += "\t";
-              replyString += String(pressureLog[i]);
-              replyString += "\t";
-              replyString += String(humidityLog[i]);
-              replyString += "\n";
-            }
-            for (int i=0; i<indexLog; i++) {
-              replyString += timeLog[i];
-              replyString += "\t";
-              replyString += String(temperatureLog[i]);
-              replyString += "\t";
-              replyString += String(pressureLog[i]);
-              replyString += "\t";
-              replyString += String(humidityLog[i]);
-              replyString += "\n";
-            }
-            //Serial.println(replyString);
-            break;
-          case GET_HOSTNAME:
-            replyString += hostname; 
-            break; 
-          case SET_HOSTNAME:
-            hostname = String(packetBuffer).substring(3);
-            replyString += hostname;
-            saveHostnameToEeprom(hostname);
-            break;  
-          default:
-            replyString = String(UNKNOWN_COMMAND) + " "; 
-            break;
-        }
-
-        udpSendString(replyString);
-        /*
-        // send a reply, to the IP address and port that sent us the packet we received
-       Udp.beginPacket(Udp.remoteIP(), Udp.remotePort());
-       replyString.toCharArray(replyBuffer,replyString.length()+1);
-       Udp.write(replyBuffer);
-       Udp.endPacket();*/
-       
-      }
-
-      // Measure and log temperature
-      measure();
-      logAll();
-
-      // updateClock creates 1s delay independant of run time loop
-      // !!! This is not accurate enough !!!
-      updateClock();
-      //sendData();
-      
-// <-- BME280 loop end ---  
-    }
-  }
+    #endif
+   
 }
 
 // --> EEPROM functions begin ---
@@ -536,9 +515,6 @@ void saveIpAddressToEeprom(String name) {
     EEPROM.write(fixedIpAddress+i,name.charAt(i));
   }
 }
-
-// <-- EEPROM functions end ---
-
 
 // --> Wifi functions begin ---
 
@@ -592,6 +568,7 @@ void printMacAddress(byte mac[]) {
   Serial.println();
 }
 
+/*
 void recvString() {
   // Check for new data on serial.
   // If so, read it. If END_MARKER, close string with '\0'
@@ -620,11 +597,23 @@ void recvString() {
     }
   }
 }
+*/
+// Serial functions
+//------------------
+String getStringFromSerial(String askfor) {
+  String answer;
 
+  Serial.print(askfor);
+  answer = Serial.readStringUntil('\r');
+  if (answer.length() == 0) {
+    answer = "none";
+  }
+  Serial.println(answer);
+  return answer;
+}
 
-// <-- Wifi functions end ---
-
-// --> BME280 functions begin ---
+// BME280 functions
+//-----------------
 
 void udpSendString(String toSend) {
   Serial.println(toSend);
@@ -647,11 +636,6 @@ void measure() {
   currentTemperature = currentTemperatureStr.toFloat();
   currentPressure = currentPressureStr.toFloat();
   currentHumidity = currentHumidityStr.toFloat();
-  /*
-    Serial.print("Temp: "); Serial.print(currentTemperature); Serial.println(" °C");
-    Serial.print("Druk: "); Serial.print(currentPressure); Serial.println(" hPa");
-    Serial.print("Humi: "); Serial.print(currentHumidity); Serial.println(" %");
-  */
 }
 
 void logAll() {
@@ -717,4 +701,57 @@ void updateClock() {
   // Update logging timer
   logSeconds += 1;
 }
-// <-- BME280 functions end ---
+
+// PIT
+//----
+void initPIT() {
+   // Setup x-tal klok
+  // Wacht tot x-tal klok stabiel is
+  while((CLKCTRL.MCLKSTATUS & CLKCTRL_XOSC32KS_bm));  // Wacht tot XOSC32KS 0 is
+
+  // Configureer klok
+  // Configuration Change proctection alvorens schrijven naar CLKCTRL is nodig !!!
+  CCP = CCP_IOREG_gc;
+  CLKCTRL.XOSC32KCTRLA |= CLKCTRL_ENABLE_bm;    // Selekteer X-tal
+
+  // Selecteer klok
+  RTC.CLKSEL = RTC_CLKSEL_TOSC32K_gc;
+  
+  // Enable interrupt  PIT
+  RTC.PITINTCTRL = RTC_PITEN_bm;
+  // Selecteer periode (32768 cycli)
+  RTC.PITCTRLA = (RTC_PITCTRLA &~ RTC_PERIOD_gm) | RTC_PERIOD1_bm  | RTC_PERIOD2_bm | RTC_PERIOD3_bm; 
+  // Enable PIT
+  while(RTC.STATUS);
+  while (RTC.PITSTATUS);
+  RTC.PITCTRLA |= RTC_PITEN_bm;
+
+  sei();
+}
+
+ISR(RTC_PIT_vect) {  
+
+  seconds += 1;
+  logSeconds += 1;
+  #ifdef LCD
+  updateLCD = true;
+  #endif
+
+  if ( seconds >= 60 ) { 
+    seconds = 0;
+    minutes += 1;
+  }
+  
+  if (minutes>=60) { 
+    minutes=0;
+    hours+=1;
+    }
+    
+  if (hours>=24) {
+    hours=0;
+  }
+
+  // Clear PIT interrupt flag
+  RTC.PITINTFLAGS = 1;
+
+}
